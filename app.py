@@ -9,9 +9,21 @@ app = Flask(__name__)
 JSON_FILE = "data.json"
 
 @app.route("/")
-def get_description():
-    package_name = request.args.get("id", "com.kursx.smartbook")
+def get_descriptions():
+    packages_names = list(request.args.get("id", "com.kursx.smartbook,ru.yandex.music").split(","))
     lang = request.args.get("hl", "ru").lower()
+
+    response = {}
+
+    for package_name in packages_names:
+        result = parsing(package_name, lang)
+        response[package_name] = result
+
+    return jsonify({ "result": response })
+
+def parsing(package_name, lang):
+    package_name = package_name
+    lang = lang
 
     with open(JSON_FILE, "r", encoding="utf-8") as file:
         data = json.load(file)
@@ -88,17 +100,14 @@ def get_description():
     else:
         data = {}
 
-    data[package_name] = {
+    data[lang][package_name] = {
         "description": description_result,
-        "lang": lang
     }
 
     with open(JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
     return jsonify({
-        "package": package_name,
-        "lang": lang,
         "description": description_result
     })
 
