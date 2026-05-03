@@ -1,81 +1,107 @@
 from flask import Flask, request, jsonify
-import requests
 from bs4 import BeautifulSoup
-import json
-import os
+
+import requests
+import sqlite3
+
 
 app = Flask(__name__)
 
-JSON_FILE = "data.json"
+DATABASE_NAME = "database.db"
 
-@app.route("/")
-def get_descriptions():
-    packages_names = list(request.args.get("id", "com.kursx.smartbook,ru.yandex.music").split(","))
-    lang = request.args.get("hl", "ru").lower()
+PLAY_STORE_URL = "https://play.google.com/store/apps/details"
 
-    response = {}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
-    for package_name in packages_names:
-        result = parsing(package_name, lang)
-        response[package_name] = result
-
-    return jsonify({ "result": response })
-
-def parsing(package_name, lang):
-    package_name = package_name
-    lang = lang
-
-    with open(JSON_FILE, "r", encoding="utf-8") as file:
-        data = json.load(file)
-        if package_name in data[lang]:
-            return data[lang][package_name]
-        
-    url = "https://play.google.com/store/apps/details"
-
-    params = {
-        "id": package_name,
-        "hl": lang
+MARKERS = {
+    "ru": {
+        "start": ["Описание"],
+        "stop": ["Что нового", "Обновлено", "Последнее обновление"]
+    },
+    "en": {
+        "start": ["About this app"],
+        "stop": ["What's new", "Updated on"]
     }
+}
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
 
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code != 200:
-        return jsonify({"error": "Ошибка запроса"})
+def init_database():
+    with sqlite3.connect(DATABASE_NAME) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS descriptions (
+                package_name TEXT NOT NULL,
+                language TEXT NOT NULL,
+                description TEXT NOT NULL,
+                PRIMARY KEY (package_name, language)
+            )
+        """)
 
-    soup = BeautifulSoup(response.text, "html.parser")
+
+def get_cached_description(package_name: str, language: str):
+    with sqlite3.connect(DATABASE_NAME) as connection:
+        cursor = connection.execute("""
+            SELECT description
+            FROM descriptions
+            WHERE package_name = ? AND language = ?
+        """, (package_name, language))
+
+        row = cursor.fetchone()
+
+    return row[0] if row else None
+
+
+def save_description(package_name: str, language: str, description: str):
+    with sqlite3.connect(DATABASE_NAME) as connection:
+        connection.execute("""
+            INSERT OR REPLACE INTO descriptions (
+                package_name,
+                language,
+                description
+            )
+            VALUES (?, ?, ?)
+        """, (package_name, language, description))
+
+
+def fetch_page(package_name: str, language: str):
+    response = requests.get(
+        PLAY_STORE_URL,
+        params={
+            "id": package_name,
+            "hl": language
+        },
+        headers=HEADERS,
+        timeout=15
+    )
+
+    response.raise_for_status()
+
+    return response.text
+
+
+def extract_description(html: str, language: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
     lines = soup.get_text(separator="\n").split("\n")
 
-    description = []
-    in_progress = False
+    language_markers = MARKERS.get(language, MARKERS["en"])
 
-    markers = {
-        "ru": {
-            "start": ["Описание"],
-            "stop": ["Что нового", "Обновлено", "Последнее обновление"]
-        },
-        "en": {
-            "start": ["About this app"],
-            "stop": ["What's new", "Updated on"]
-        }
-    }
+    start_markers = language_markers["start"]
+    stop_markers = language_markers["stop"]
 
-    if lang in markers:
-        start_markers = markers[lang]["start"]
-        stop_markers = markers[lang]["stop"]
-    else:
-        start_markers = markers["ru"]["start"]
-        stop_markers = markers["ru"]["stop"]
+    description_lines = []
+
+    is_description_started = False
 
     for line in lines:
         line = line.strip()
+
         if not line:
             continue
 
         if any(line.startswith(marker) for marker in start_markers):
-            in_progress = True
+            is_description_started = True
             continue
 
         if any(marker in line for marker in stop_markers):
@@ -84,33 +110,77 @@ def parsing(package_name, lang):
         if "arrow_forward" in line:
             continue
 
-        if in_progress:
-            description.append(line)
+        if is_description_started:
+            description_lines.append(line)
 
-    description_result = " ".join(description).strip()
-    if not description_result:
-        description_result = "Описание не найдено"
+    description = " ".join(description_lines).strip()
 
-    if os.path.exists(JSON_FILE):
-        with open(JSON_FILE, "r", encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-            except json.JSONDecodeError:
-                data = {}
-    else:
-        data = {}
+    return description or "Description not found"
 
-    data[lang][package_name] = {
-        "description": description_result,
+
+def get_description(package_name: str, language: str):
+    cached_description = get_cached_description(package_name, language)
+
+    if cached_description:
+        return {
+            "description": cached_description,
+            "cached": True
+        }
+
+    try:
+        html = fetch_page(package_name, language)
+
+        description = extract_description(html, language)
+
+        save_description(package_name, language, description)
+
+        return {
+            "description": description,
+            "cached": False
+        }
+
+    except requests.RequestException as error:
+        return {
+            "error": str(error)
+        }
+
+
+@app.route("/")
+def index():
+    package_ids = request.args.get("id")
+    language = request.args.get("hl")
+
+    if not package_ids:
+        return jsonify({
+            "error": "Missing query parameter: id"
+        }), 400
+
+    if not language:
+        return jsonify({
+            "error": "Missing query parameter: hl"
+        }), 400
+
+    packages = [
+        package.strip()
+        for package in package_ids.split(",")
+        if package.strip()
+    ]
+
+    result = {
+        package: get_description(package, language.lower())
+        for package in packages
     }
 
-    with open(JSON_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
     return jsonify({
-        "description": description_result
+        "result": result
     })
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    init_database()
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True
+    )
